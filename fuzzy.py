@@ -56,7 +56,7 @@ def parse_explanation(response_text):
         print("Warning: Could not find <<<START_EXPLANATION>>> tags in the response.")
         return ""
 
-def inject_bugs(code_snippet, client, model):
+def inject_bugs(code_snippet, client, model, language="python"):
     """
     Constructs a prompt to inject bugs into the given code snippet and calls the API.
     The prompt instructs the model to return only the modified code wrapped in
@@ -68,10 +68,30 @@ def inject_bugs(code_snippet, client, model):
     If the response does not contain the required tags, the function sends one follow-up
     message (continuing the chat) requesting a strictly formatted answer. If that follow-up
     still fails, the conversation is restarted.
+    
+    Args:
+        code_snippet: The code to inject bugs into
+        client: OpenAI client instance
+        model: The model to use for bug injection
+        language: Programming language of the code (defaults to "python")
     """
+    # Try to detect the language from the code if it's not provided
+    if language == "python" and not code_snippet.strip().startswith(("def ", "class ", "import ", "from ", "#!", "#!/")):
+        # Do a simple check for other common languages
+        if code_snippet.strip().startswith(("function ", "const ", "let ", "var ", "import ", "export ")):
+            language = "javascript"
+        elif code_snippet.strip().startswith(("use ", "fn ", "struct ", "impl ", "pub ", "mod ")):
+            language = "rust"
+        elif code_snippet.strip().startswith(("package ", "import ", "func ", "type ", "const ", "var ")):
+            language = "go"
+        elif "public class" in code_snippet or "private class" in code_snippet:
+            language = "java"
+        elif "<?" in code_snippet[:100] or "<?php" in code_snippet[:100]:
+            language = "php"
+    
     severity, persona = sample_severity()
     original_prompt = (
-        f"Inject bugs into the following Python code so that the resulting code is exactly the same format as the input but with injected bugs. "
+        f"Inject bugs into the following {language.upper()} code so that the resulting code is exactly the same format as the input but with injected bugs. "
         f"The bugs should be {severity} like a {persona} would introduce. "
         f"The modified code must be returned inside the tags <<<START_CODE>>> and <<<END_CODE>>> with no additional commentary, explanations, or comments.\n\n"
         f"Do NOT include any comments on what is wrong with the code. The model should only return the modified code. "
@@ -163,12 +183,24 @@ def inject_bugs(code_snippet, client, model):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fuzzy: Spawn API requests in groups to inject bugs into Python code from the CodeParrot dataset."
+        description="Fuzzy: Spawn API requests in groups to inject bugs into code from any HuggingFace dataset."
     )
-    parser.add_argument("--group_size", type=int, default=100, help="Number of concurrent requests to spawn at once")
-    parser.add_argument("--max_requests", type=int, default=None, help="Optional: Maximum number of samples to process")
-    parser.add_argument("--model", type=str, default="deepseek/deepseek-chat:free", help="Model to use for bug injection")
-    parser.add_argument("--output_file", type=str, default="bug_injected_results.jsonl", help="Output file (JSON Lines)")
+    parser.add_argument("--dataset", type=str, default="codeparrot/codeparrot-clean-train", 
+                        help="HuggingFace dataset name to use")
+    parser.add_argument("--split", type=str, default="train", 
+                        help="Dataset split to use")
+    parser.add_argument("--column", type=str, default="content", 
+                        help="Column name containing the code to process")
+    parser.add_argument("--language", type=str, default="python",
+                        help="Programming language of the code (auto-detection will be attempted if not specified)")
+    parser.add_argument("--group_size", type=int, default=100, 
+                        help="Number of concurrent requests to spawn at once")
+    parser.add_argument("--max_requests", type=int, default=None, 
+                        help="Optional: Maximum number of samples to process")
+    parser.add_argument("--model", type=str, default="deepseek/deepseek-chat:free", 
+                        help="Model to use for bug injection")
+    parser.add_argument("--output_file", type=str, default="bug_injected_results.jsonl", 
+                        help="Output file (JSON Lines)")
     args = parser.parse_args()
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -181,10 +213,15 @@ def main():
     )
 
     # Stream the dataset from Hugging Face.
-    print("Loading dataset (streaming from Hugging Face)...")
-    dataset = load_dataset("codeparrot/codeparrot-clean-train", split="train", streaming=True)
+    print(f"Loading dataset {args.dataset} (streaming from Hugging Face)...")
+    try:
+        dataset = load_dataset(args.dataset, split=args.split, streaming=True)
+    except Exception as e:
+        print(f"Error loading dataset: {e}")
+        print("Please check that the dataset name and split are correct.")
+        return
     
-    # Iterate over individual samples (each sample should have a "content" field).
+    # Iterate over individual samples.
     sample_iter = iter(dataset)
     
     processed_count = 0
@@ -200,8 +237,18 @@ def main():
                     sample = next(sample_iter)
                 except StopIteration:
                     break
-                original_code = sample.get("content")
-                future = executor.submit(inject_bugs, original_code, client, args.model)
+                
+                # Get code from the specified column
+                if args.column not in sample:
+                    print(f"Warning: Column '{args.column}' not found in sample. Available columns: {list(sample.keys())}")
+                    continue
+                
+                original_code = sample.get(args.column)
+                if not original_code or not isinstance(original_code, str):
+                    print(f"Warning: Skipping invalid code in sample. Expected string, got {type(original_code)}")
+                    continue
+                
+                future = executor.submit(inject_bugs, original_code, client, args.model, args.language)
                 futures.append((future, original_code))
                 processed_count += 1
                 if args.max_requests is not None and processed_count >= args.max_requests:
